@@ -63,6 +63,11 @@ async def identify_pill(
 
     # Read and validate file size
     contents = await image.read()
+    if not contents:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Empty image file.",
+        )
     max_size = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
     if len(contents) > max_size:
         raise HTTPException(
@@ -89,14 +94,21 @@ async def identify_pill(
         img.load()  # Force eager load before returning
         return img.size
 
-    img_width, img_height = await asyncio.to_thread(_get_img_size, contents)
+    try:
+        img_width, img_height = await asyncio.to_thread(_get_img_size, contents)
+    except Exception:
+        # Corrupt / non-decodable image — fail cleanly instead of a 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or unreadable image file.",
+        )
 
     mapped_predictions: list[ScanPrediction] = []
     inference_source = "unidentified"
 
     # ── Vision LLM identification (Gemini) ────────────────────────────
     try:
-        llm_result = await pill_id_service.identify_pill(contents, image.content_type, user=user)
+        llm_result = await pill_id_service.identify_pill(contents, image.content_type, user=user, db=db)
     except pill_id_service.PillIdError as e:
         print(f"[Scan Router] LLM identification failed: {e}")
         llm_result = None

@@ -9,17 +9,170 @@ Every endpoint depends on ``get_current_admin`` so access is enforced on the
 
 from uuid import UUID
 from typing import Optional
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, case
 
 from app.database import get_db
 from app.models.user import User
+from app.models.scan_history import ScanHistory
+from app.models.medication import Medication
+from app.models.reminder import Reminder
+from app.models.user_query import UserQuery
 from app.schemas.user import AdminUserResponse, UpdateUserStatusRequest
 from app.services.auth_service import get_current_admin
+from app.config import get_settings
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
+settings = get_settings()
+
+
+@router.get("/db-status")
+async def db_status(admin: User = Depends(get_current_admin)):
+    """
+    [Admin] Report whether storage is persistent so the admin can see at a
+    glance if data survives redeploys. Never exposes credentials — only the
+    engine type and host (host shown for Postgres so it's clear which DB).
+    """
+    url = settings.DATABASE_URL or ""
+    is_sqlite = url.startswith("sqlite")
+    host = None
+    if not is_sqlite:
+        from urllib.parse import urlsplit
+        host = urlsplit(url).hostname
+
+    return {
+        "engine": "sqlite" if is_sqlite else "postgres",
+        "persistent": not is_sqlite,
+        "host": host,
+    }
+
+
+@router.get("/stats")
+async def stats(
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """
+    [Admin] System-wide activity counters for the dashboard overview:
+    total scans, active medications, active reminders, and assistant
+    lookups. Counts only — no per-user data is exposed.
+    """
+    async def count(model, *conditions) -> int:
+        query = select(func.count()).select_from(model)
+        for cond in conditions:
+            query = query.where(cond)
+        result = await db.execute(query)
+        return int(result.scalar_one() or 0)
+
+    # ── 7-day scan trend ──────────────────────────────────────────────
+    # Bucketing is done in Python (not SQL date functions) so it behaves
+    # identically on SQLite (tests) and Postgres (prod). Buckets are keyed
+    # by UTC date; the SQL filter is a generous lower bound and correctness
+    # comes from the bucket dict, so any extra/older row is simply ignored.
+    today = datetime.utcnow().date()
+    trend_buckets: dict[str, int] = {
+        (today - timedelta(days=6 - i)).isoformat(): 0 for i in range(7)
+    }
+    lower_bound = datetime(today.year, today.month, today.day) - timedelta(days=7)
+    scan_rows = await db.execute(
+        select(ScanHistory.scanned_at).where(ScanHistory.scanned_at >= lower_bound)
+    )
+    for ts in scan_rows.scalars().all():
+        if ts is None:
+            continue
+        key = ts.date().isoformat()
+        if key in trend_buckets:
+            trend_buckets[key] += 1
+    scan_trend = [{"date": d, "count": c} for d, c in trend_buckets.items()]
+
+    return {
+        "scans": await count(ScanHistory),
+        "medications": await count(Medication, Medication.is_active.is_(True)),
+        "reminders": await count(Reminder, Reminder.is_active.is_(True)),
+        "queries": await count(UserQuery),
+        "scan_trend": scan_trend,
+    }
+
+
+@router.get("/query-stats")
+async def query_stats(
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """
+    [Admin] Per-user breakdown of drug-assistant lookups: how many queries each
+    user made, how many were recognized, and when they last searched. Only users
+    with at least one query appear, ordered by query count (most active first).
+    The ``case`` expression is portable across SQLite (tests) and Postgres (prod).
+    """
+    recognized_sum = func.sum(
+        case((UserQuery.recognized.is_(True), 1), else_=0)
+    )
+    query = (
+        select(
+            User.id,
+            User.full_name,
+            User.email,
+            func.count(UserQuery.id).label("total"),
+            recognized_sum.label("recognized"),
+            func.max(UserQuery.created_at).label("last_at"),
+        )
+        .join(UserQuery, UserQuery.user_id == User.id)
+        .group_by(User.id, User.full_name, User.email)
+        .order_by(func.count(UserQuery.id).desc(), func.max(UserQuery.created_at).desc())
+        .limit(limit)
+    )
+    rows = await db.execute(query)
+
+    users = []
+    for row in rows.all():
+        last_at = row.last_at
+        users.append({
+            "user_id": str(row.id),
+            "full_name": row.full_name,
+            "email": row.email,
+            "total": int(row.total or 0),
+            "recognized": int(row.recognized or 0),
+            "last_at": last_at.isoformat() if last_at is not None else None,
+        })
+    return {"users": users}
+
+
+@router.get("/users/{user_id}/queries")
+async def user_queries(
+    user_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """
+    [Admin] The individual drug-assistant lookups made by one user — the query
+    text, when it was made, whether the assistant recognized it, and (when
+    recognized) the drug name it resolved to. Newest first.
+    """
+    result = await db.execute(
+        select(UserQuery)
+        .where(UserQuery.user_id == user_id)
+        .order_by(UserQuery.created_at.desc())
+        .limit(limit)
+    )
+    queries = []
+    for q in result.scalars().all():
+        recognized_name = None
+        if q.recognized and isinstance(q.result, dict):
+            recognized_name = q.result.get("name") or None
+        queries.append({
+            "id": str(q.id),
+            "query_text": q.query_text,
+            "recognized": bool(q.recognized),
+            "recognized_name": recognized_name,
+            "created_at": q.created_at.isoformat() if q.created_at is not None else None,
+        })
+    return {"queries": queries}
 
 
 @router.get("/users", response_model=list[AdminUserResponse])

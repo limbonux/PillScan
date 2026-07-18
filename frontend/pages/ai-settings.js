@@ -7,6 +7,7 @@
 import i18n from '../js/i18n.js';
 import router from '../js/router.js';
 import api from '../js/api.js';
+import storage from '../js/storage.js';
 import toast from '../components/toast.js';
 
 const KEY_SLOTS = 5;
@@ -80,6 +81,7 @@ const AISettingsPage = {
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>
         </div>
+        ${configured ? `<p class="text-xs text-tertiary mt-2">🔒 ${i18n.t('ai_key_keep_hint')}</p>` : ''}
         <div class="flex items-center justify-end mt-2">
           ${configured ? `<button class="btn btn-ghost btn-sm" id="gemini-clear-${slot}" style="color:var(--color-error);">${i18n.t('ai_clear_key')}</button>` : ''}
         </div>
@@ -99,6 +101,11 @@ const AISettingsPage = {
 
     return `
       <p class="text-sm text-secondary mb-3">${i18n.t('ai_settings_intro')}</p>
+
+      ${storage.isAdmin() ? `
+      <div class="card mb-4" style="background:rgba(34,197,94,0.10); border:1px solid rgba(34,197,94,0.30);">
+        <p class="text-xs" style="line-height:1.7;">${i18n.t('ai_admin_shared_note')}</p>
+      </div>` : ''}
 
       <div class="card mb-4" style="background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25);">
         <div class="flex gap-2 items-start">

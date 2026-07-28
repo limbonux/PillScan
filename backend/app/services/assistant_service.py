@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from app.config import get_settings
 from app.services import llm_keys
+from app.services import provider_keys
 
 settings = get_settings()
 
@@ -64,8 +65,13 @@ NOT_CONFIGURED_MESSAGE_AR = (
 
 
 def is_configured(user: Optional[Any] = None) -> bool:
-    """True when at least one Gemini key (user or server) is available."""
-    return bool(llm_keys.resolve_gemini_keys(user))
+    """True when at least one key (Gemini or an extra text provider) is available."""
+    if llm_keys.resolve_gemini_keys(user):
+        return True
+    return any(
+        provider_keys.user_provider_keys(user, provider)
+        for provider in provider_keys.ordered_providers()
+    )
 
 
 async def _ask_gemini(drug_name: str, api_key: str, model: str) -> str:
@@ -196,25 +202,42 @@ async def get_drug_info(drug_name: str, user: Optional[Any] = None, db: Any = No
         "message": "",
     }
 
-    keys = await llm_keys.resolve_gemini_keys_async(user, db)
-    if not keys:
+    gemini_keys = await llm_keys.resolve_gemini_keys_async(user, db)
+
+    # Extra text providers (Mistral / Groq / OpenRouter) as failover: user keys,
+    # then admin-shared, then server env — tried after Gemini is exhausted.
+    extra: list[tuple[str, str]] = []
+    for provider in provider_keys.ordered_providers():
+        for key in await provider_keys.resolve_keys_async(provider, user, db):
+            extra.append((provider, key))
+
+    if not gemini_keys and not extra:
         return {**base, "is_configured": False, "message": NOT_CONFIGURED_MESSAGE_AR}
 
-    # Call Gemini with automatic key failover. A classified GeminiError (invalid
-    # key, quota, timeout, network...) becomes a clear Arabic message rather than
-    # a generic 502, so the user knows exactly what to fix.
-    try:
-        raw = await llm_keys.call_with_failover(
-            keys, lambda key: _ask_gemini(drug_name, key, model)
-        )
-    except llm_keys.GeminiError as e:
-        return {**base, "is_configured": True, "message": e.message_ar}
-    except Exception:  # noqa: BLE001 - never leak a 500 to the client
-        return {**base, "is_configured": True, "message": "تعذّر جلب معلومات الدواء. حاول مرة أخرى."}
+    user_prompt = f"اسم الدواء: {drug_name}"
 
-    parsed = _parse_json(raw)
-    if parsed is None:
-        # Provider succeeded but the reply wasn't valid JSON — clear fallback.
-        return {**base, "is_configured": True, "message": "تعذّر تحليل رد المساعد. حاول مرة أخرى."}
+    # 1) Gemini first (native call — also does per-key model fallback). The first
+    #    key that returns parseable JSON wins.
+    for key in gemini_keys:
+        try:
+            raw = await _ask_gemini(drug_name, key, model)
+        except Exception:  # noqa: BLE001 - try the next key/provider
+            continue
+        parsed = _parse_json(raw)
+        if parsed is not None:
+            return _normalize(parsed, drug_name, model)
 
-    return _normalize(parsed, drug_name, model)
+    # 2) Extra OpenAI-compatible providers, in registry order.
+    for provider, key in extra:
+        try:
+            raw = await provider_keys.openai_compatible_generate(
+                provider, SYSTEM_PROMPT_AR, user_prompt, key
+            )
+        except Exception:  # noqa: BLE001 - try the next key/provider
+            continue
+        parsed = _parse_json(raw)
+        if parsed is not None:
+            return _normalize(parsed, drug_name, provider_keys.provider_model(provider))
+
+    # Every key across every provider failed or returned unparseable output.
+    return {**base, "is_configured": True, "message": "تعذّر جلب معلومات الدواء. حاول مرة أخرى."}

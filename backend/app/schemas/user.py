@@ -138,3 +138,38 @@ class AISettingsResponse(BaseModel):
     provider: str = "gemini"
     keys: List[GeminiKeyStatus]
     configured_count: int
+
+
+# ── Extra text providers (Mistral / Groq / OpenRouter) ───────────────────
+
+class ProviderKeyStatus(BaseModel):
+    """Status of one provider key slot — never exposes the raw key."""
+    slot: int                               # 1..10
+    configured: bool
+    hint: Optional[str] = None              # e.g. "••••••••abcd"
+
+
+class ProviderStatus(BaseModel):
+    """All slots for one provider."""
+    provider: str                           # mistral | groq | openrouter
+    label: str                              # display name
+    model: str                              # default model used
+    keys: List[ProviderKeyStatus]
+    configured_count: int
+
+
+class ProviderKeysResponse(BaseModel):
+    """Status of every extra text provider — no raw keys, masked hints only."""
+    providers: List[ProviderStatus]
+    slots_per_provider: int
+
+
+class ProviderKeyUpdateRequest(BaseModel):
+    """
+    Set or clear one provider key slot.
+    - ``key`` string sets/replaces the slot.
+    - empty string ("") clears it.
+    """
+    provider: str = Field(..., pattern=r"^(mistral|groq|openrouter)$")
+    slot: int = Field(..., ge=1, le=10)
+    key: Optional[str] = Field(None, max_length=512)

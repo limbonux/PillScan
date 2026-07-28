@@ -233,6 +233,21 @@ class ApiClient {
     return this.get('/scan/llm-diagnostics');
   }
 
+  /** Status of the extra text-provider keys (Mistral/Groq/OpenRouter) */
+  getProviderKeys() {
+    return this.get('/users/me/ai-keys');
+  }
+
+  /**
+   * Set or clear one extra-provider key slot.
+   * @param {string} provider  mistral | groq | openrouter
+   * @param {number} slot      1..10
+   * @param {string} key       key to set, or "" to clear
+   */
+  updateProviderKey(provider, slot, key) {
+    return this.put('/users/me/ai-keys', { provider, slot, key });
+  }
+
   // ── Drug Endpoints ────────────────────────────────────────────
 
   searchDrugs(query = '', filters = {}) {

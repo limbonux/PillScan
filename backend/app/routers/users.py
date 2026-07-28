@@ -16,8 +16,13 @@ from app.schemas.user import (
     AISettingsUpdateRequest,
     AISettingsResponse,
     GeminiKeyStatus,
+    ProviderKeyStatus,
+    ProviderStatus,
+    ProviderKeysResponse,
+    ProviderKeyUpdateRequest,
 )
 from app.services.auth_service import get_current_user
+from app.services import provider_keys
 from app.config import get_settings
 from app.utils.crypto import encrypt_secret, decrypt_secret, mask_secret
 
@@ -124,3 +129,53 @@ async def update_ai_settings(
     await db.flush()
     await db.refresh(user)
     return _build_ai_settings_response(user)
+
+
+# ── Extra text providers (Mistral / Groq / OpenRouter) ───────────────────
+
+def _build_provider_keys_response(user: User) -> ProviderKeysResponse:
+    """Shape every extra provider's key slots for the client (no raw keys)."""
+    providers = []
+    for provider in provider_keys.ordered_providers():
+        stored = provider_keys.user_provider_slots(user, provider)
+        slots = []
+        configured = 0
+        for slot in range(1, provider_keys.SLOTS_PER_PROVIDER + 1):
+            raw = decrypt_secret(stored[slot - 1])
+            if raw:
+                configured += 1
+            slots.append(ProviderKeyStatus(slot=slot, configured=bool(raw), hint=mask_secret(raw)))
+        providers.append(ProviderStatus(
+            provider=provider,
+            label=provider_keys.provider_label(provider),
+            model=provider_keys.provider_model(provider),
+            keys=slots,
+            configured_count=configured,
+        ))
+    return ProviderKeysResponse(
+        providers=providers,
+        slots_per_provider=provider_keys.SLOTS_PER_PROVIDER,
+    )
+
+
+@router.get("/me/ai-keys", response_model=ProviderKeysResponse)
+async def get_provider_keys(user: User = Depends(get_current_user)):
+    """Status of the user's extra text-provider keys (Mistral/Groq/OpenRouter)."""
+    return _build_provider_keys_response(user)
+
+
+@router.put("/me/ai-keys", response_model=ProviderKeysResponse)
+async def update_provider_key(
+    request: ProviderKeyUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Set or clear one extra-provider key slot.
+    - Provide ``key`` to set/replace it (encrypted before storage).
+    - Provide an empty string to clear it.
+    """
+    provider_keys.set_user_provider_slot(user, request.provider, request.slot, request.key)
+    await db.flush()
+    await db.refresh(user)
+    return _build_provider_keys_response(user)

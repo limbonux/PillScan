@@ -45,6 +45,11 @@ class User(Base):
     openai_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     llm_provider: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
+    # Extra text-provider keys (Mistral / Groq / OpenRouter), used as failover
+    # for the drug assistant. Stored ENCRYPTED as {provider: [enc_key, ...]},
+    # up to 10 slots per provider. See app.services.provider_keys.
+    provider_api_keys: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # ── Role & approval workflow ──────────────────────────────────────────
     # role:   USER (regular end user) | ADMIN (dashboard access).
     # status: PENDING (awaiting admin approval) | APPROVED | REJECTED.

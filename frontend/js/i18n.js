@@ -245,6 +245,11 @@ const translations = {
     ai_admin_shared_note: '👑 أنت مدير: المفاتيح التي تضيفها هنا تُستخدم تلقائيًا لجميع المستخدمين (المسح، التلخيص، والمساعد الدوائي) — لا حاجة لأن يضيف كل مستخدم مفتاحه.',
     ai_no_changes: 'لا توجد تغييرات لحفظها',
     ai_model: 'الموديل',
+    ai_providers_title: 'مزوّدون إضافيون (بدائل قوية للمساعد)',
+    ai_providers_intro: 'أضف مفاتيح من مزوّدين مجانيين وأقوياء تُستخدم كبديل تلقائي عند نفاد رصيد Gemini. لكل مزوّد ١٠ خانات. Mistral وOpenRouter يدعمان أيضاً المسح بالصورة وتلخيص النشرة (رؤية)، أما Groq فنصّي (للمساعد الدوائي فقط).',
+    ai_provider_slots_configured: 'مفتاح مُفعّل',
+    ai_get_key: 'احصل على مفتاح',
+    ai_key_saved: 'تم حفظ المفتاح',
 
     // ── Registration / Approval ────────────────────────────────────
     phone_required: 'رقم الجوال مطلوب',
@@ -570,6 +575,11 @@ const translations = {
     ai_key_cleared: 'Key removed',
     ai_key_keep_hint: 'Leave the field empty to keep the saved key. It is only removed by pressing "Remove key".',
     ai_admin_shared_note: '👑 You are an admin: keys you add here are used automatically for ALL users (scan, summary, and drug assistant) — each user does not need their own key.',
+    ai_providers_title: 'Extra providers (strong assistant fallback)',
+    ai_providers_intro: 'Add keys from free, strong providers used as automatic fallback when Gemini runs out. Each provider has 10 slots. Mistral and OpenRouter also support photo scan & leaflet summaries (vision); Groq is text-only (drug assistant).',
+    ai_provider_slots_configured: 'key(s) set',
+    ai_get_key: 'Get a key',
+    ai_key_saved: 'Key saved',
     ai_model: 'Model',
     ai_test_keys: 'Test keys',
     ai_key_ok: 'Works ✓',

@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 from app.config import get_settings
 from app.services import llm_keys
+from app.services import provider_keys
 
 settings = get_settings()
 
@@ -98,8 +99,13 @@ async def _summarize_with_gemini(image_b64: str, mime_type: str, api_key: str, m
 
 
 def is_configured(user: Optional[Any] = None) -> bool:
-    """True when at least one Gemini key (user or server) is available."""
-    return bool(llm_keys.resolve_gemini_keys(user))
+    """True when any vision-capable key (Gemini or a vision provider) is set."""
+    if llm_keys.resolve_gemini_keys(user):
+        return True
+    return any(
+        provider_keys.user_provider_keys(user, provider)
+        for provider in provider_keys.vision_providers()
+    )
 
 
 async def summarize_leaflet(
@@ -134,8 +140,15 @@ async def summarize_leaflet(
         "disclaimer_en": DISCLAIMER_EN,
     }
 
-    keys = await llm_keys.resolve_gemini_keys_async(user, db)
-    if not keys:
+    gemini_keys = await llm_keys.resolve_gemini_keys_async(user, db)
+
+    # Vision failover providers (Pixtral / OpenRouter vision).
+    vision_extra: list = []
+    for provider in provider_keys.vision_providers():
+        for key in await provider_keys.resolve_keys_async(provider, user, db):
+            vision_extra.append((provider, key))
+
+    if not gemini_keys and not vision_extra:
         return {
             **base_result,
             "summary": NOT_CONFIGURED_MESSAGE_AR,
@@ -145,13 +158,30 @@ async def summarize_leaflet(
     mime_type = _guess_ext_mime(content_type)
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    try:
-        summary = await llm_keys.call_with_failover(
-            keys, lambda key: _summarize_with_gemini(image_b64, mime_type, key, model)
-        )
-    except LeafletServiceError:
-        raise
-    except Exception as e:  # noqa: BLE001 - normalise any failover error
-        raise LeafletServiceError(str(e))
+    last_error: Optional[Exception] = None
 
-    return {**base_result, "summary": summary, "is_configured": True}
+    # 1) Gemini vision keys.
+    for key in gemini_keys:
+        try:
+            summary = await _summarize_with_gemini(image_b64, mime_type, key, model)
+            return {**base_result, "summary": summary, "is_configured": True}
+        except Exception as e:  # noqa: BLE001 - try the next key/provider
+            last_error = e
+
+    # 2) Extra vision providers (OpenAI-compatible).
+    for provider, key in vision_extra:
+        try:
+            summary = await provider_keys.openai_compatible_vision(
+                provider, SUMMARY_PROMPT_AR, image_b64, mime_type, key
+            )
+            return {
+                **base_result,
+                "provider": provider,
+                "model": provider_keys.provider_vision_model(provider),
+                "summary": summary,
+                "is_configured": True,
+            }
+        except Exception as e:  # noqa: BLE001 - try the next key/provider
+            last_error = e
+
+    raise LeafletServiceError(str(last_error) if last_error else "All vision keys failed.")

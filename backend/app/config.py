@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     GEMINI_API_KEY_4: Optional[str] = None
     GEMINI_API_KEY_5: Optional[str] = None
 
+    # ── Extra text providers (assistant failover) — optional server keys ──
+    # In-app keys (admin-shared) are the main path; these env keys are an
+    # optional server-wide fallback. See app.services.provider_keys.
+    MISTRAL_API_KEY: Optional[str] = None
+    GROQ_API_KEY: Optional[str] = None
+    OPENROUTER_API_KEY: Optional[str] = None
+
     # ── AWS S3 (Image Storage) ───────────────────────────────────────────
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None

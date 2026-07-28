@@ -806,6 +806,10 @@
   border-radius: var(--radius-md);
 }
 
+/* Extra AI providers — collapsible key sections */
+.provider-chevron { transition: transform 0.25s ease; flex-shrink: 0; }
+.provider-card.is-open .provider-chevron { transform: rotate(180deg); }
+
 .stat-number {
   font-size: var(--font-size-xl);
   font-weight: var(--font-weight-bold);

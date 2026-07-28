@@ -29,25 +29,30 @@ settings = get_settings()
 # How many key slots each extra provider exposes on the AI-settings page.
 SLOTS_PER_PROVIDER = 10
 
-# Provider registry. ``model`` is a sensible free/strong default; ``base_url``
-# is the OpenAI-compatible chat-completions endpoint.
-PROVIDERS: Dict[str, Dict[str, str]] = {
+# Provider registry. ``model`` is the text default (assistant); ``vision_model``
+# is a vision-capable model used as failover for pill scan + leaflet summary
+# (None = the provider is text-only, e.g. Groq has no reliable free vision).
+# ``base_url`` is the OpenAI-compatible chat-completions endpoint.
+PROVIDERS: Dict[str, Dict[str, Optional[str]]] = {
     "mistral": {
         "label": "Mistral",
         "base_url": "https://api.mistral.ai/v1/chat/completions",
         "model": "mistral-large-latest",
+        "vision_model": "pixtral-large-latest",
         "env_prefix": "MISTRAL_API_KEY",
     },
     "groq": {
         "label": "Groq",
         "base_url": "https://api.groq.com/openai/v1/chat/completions",
         "model": "llama-3.3-70b-versatile",
+        "vision_model": None,
         "env_prefix": "GROQ_API_KEY",
     },
     "openrouter": {
         "label": "OpenRouter",
         "base_url": "https://openrouter.ai/api/v1/chat/completions",
         "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "vision_model": "meta-llama/llama-3.2-11b-vision-instruct",
         "env_prefix": "OPENROUTER_API_KEY",
     },
 }
@@ -67,7 +72,16 @@ def provider_label(provider: str) -> str:
 
 
 def provider_model(provider: str) -> str:
-    return PROVIDERS.get(provider, {}).get("model", "")
+    return PROVIDERS.get(provider, {}).get("model", "") or ""
+
+
+def provider_vision_model(provider: str) -> Optional[str]:
+    return PROVIDERS.get(provider, {}).get("vision_model")
+
+
+def vision_providers() -> List[str]:
+    """Providers that expose a vision-capable model, in failover order."""
+    return [p for p in PROVIDERS if PROVIDERS[p].get("vision_model")]
 
 
 # ── Storage (users.provider_api_keys JSON column) ──────────────────────────
@@ -179,27 +193,13 @@ async def resolve_keys_async(provider: str, user: Optional[Any], db: Any) -> Lis
 
 # ── OpenAI-compatible chat call ────────────────────────────────────────────
 
-async def openai_compatible_generate(
-    provider: str,
-    system_prompt: str,
-    user_prompt: str,
-    api_key: str,
-    *,
-    temperature: float = 0.2,
-    max_tokens: int = 2048,
-) -> str:
-    """
-    Call a provider's OpenAI-compatible chat-completions endpoint and return the
-    assistant message text. Raises on any HTTP/network error so the caller can
-    fail over to the next key/provider.
-    """
+async def _chat(provider: str, model: str, messages: list, api_key: str,
+                *, temperature: float, max_tokens: int) -> str:
+    """POST an OpenAI-compatible chat request and return the message text."""
     cfg = PROVIDERS[provider]
     payload = {
-        "model": cfg["model"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        "model": model,
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
@@ -209,8 +209,7 @@ async def openai_compatible_generate(
         headers["HTTP-Referer"] = "https://pillscan-web.onrender.com"
         headers["X-Title"] = "PillScan"
 
-    timeout = settings.LLM_TIMEOUT_SECONDS
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=settings.LLM_TIMEOUT_SECONDS) as client:
         resp = await client.post(cfg["base_url"], json=payload, headers=headers)
 
     if resp.status_code != 200:
@@ -224,3 +223,54 @@ async def openai_compatible_generate(
     if not content.strip():
         raise RuntimeError(f"{provider}: empty content")
     return content
+
+
+async def openai_compatible_generate(
+    provider: str,
+    system_prompt: str,
+    user_prompt: str,
+    api_key: str,
+    *,
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+) -> str:
+    """
+    Text chat-completion for a provider. Raises on any HTTP/network error so the
+    caller can fail over to the next key/provider.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    return await _chat(provider, provider_model(provider), messages, api_key,
+                       temperature=temperature, max_tokens=max_tokens)
+
+
+async def openai_compatible_vision(
+    provider: str,
+    prompt: str,
+    image_b64: str,
+    mime_type: str,
+    api_key: str,
+    *,
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+) -> str:
+    """
+    Vision chat-completion: send ``prompt`` + an inline image (data URL) to the
+    provider's vision model and return the text reply. Raises if the provider has
+    no vision model or the call fails, so the caller can fail over.
+    """
+    model = provider_vision_model(provider)
+    if not model:
+        raise RuntimeError(f"{provider}: no vision model")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url",
+             "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+        ],
+    }]
+    return await _chat(provider, model, messages, api_key,
+                       temperature=temperature, max_tokens=max_tokens)

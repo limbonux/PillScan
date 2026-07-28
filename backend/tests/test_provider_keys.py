@@ -8,6 +8,18 @@ import pytest
 from httpx import AsyncClient
 
 from app.services import provider_keys, assistant_service
+from app.services import pill_id_service, leaflet_service
+
+
+class _FakeUser:
+    """Minimal stand-in for a User row (no DB) for service-level tests."""
+    def __init__(self):
+        self.provider_api_keys = None
+        self.gemini_api_key = None
+        self.gemini_api_key_2 = None
+        self.gemini_api_key_3 = None
+        self.gemini_api_key_4 = None
+        self.gemini_api_key_5 = None
 
 
 class TestProviderKeyStorage:
@@ -164,3 +176,64 @@ class TestAssistantProviderFailover:
         )
         assert r.status_code == 200
         assert r.json()["is_configured"] is False
+
+
+class TestVisionFailover:
+    def test_vision_providers_registry(self):
+        # Mistral (Pixtral) and OpenRouter do vision; Groq is text-only.
+        vp = provider_keys.vision_providers()
+        assert "mistral" in vp
+        assert "openrouter" in vp
+        assert "groq" not in vp
+
+    def test_scan_is_configured_needs_vision_provider(self):
+        u = _FakeUser()
+        assert pill_id_service.is_configured(u) is False
+        # Groq has no vision model → does NOT enable scanning.
+        provider_keys.set_user_provider_slot(u, "groq", 1, "GKEY")
+        assert pill_id_service.is_configured(u) is False
+        # Mistral (Pixtral) DOES enable scanning.
+        provider_keys.set_user_provider_slot(u, "mistral", 1, "MKEY")
+        assert pill_id_service.is_configured(u) is True
+
+    @pytest.mark.asyncio
+    async def test_pill_id_uses_vision_provider(self, monkeypatch):
+        u = _FakeUser()
+        provider_keys.set_user_provider_slot(u, "mistral", 1, "MKEY")
+
+        async def fake_vision(provider, prompt, image_b64, mime_type, api_key, **kw):
+            assert provider == "mistral"
+            assert api_key == "MKEY"
+            return json.dumps({"identified": True, "candidates": [{
+                "name_en": "Deflat", "name_ar": "ديفلات", "generic_en": "Simethicone",
+                "strength": "40mg/ml", "dosage_form": "drops", "confidence": 0.9,
+            }]})
+
+        monkeypatch.setattr(provider_keys, "openai_compatible_vision", fake_vision)
+        result = await pill_id_service.identify_pill(b"img", "image/jpeg", user=u, db=None)
+        assert result["provider"] == "mistral"
+        assert result["model"] == "pixtral-large-latest"
+        assert result["candidates"][0]["name_en"] == "Deflat"
+
+    @pytest.mark.asyncio
+    async def test_pill_id_none_without_any_vision_key(self):
+        # Only a text-only Groq key → no vision path → not configured (None).
+        u = _FakeUser()
+        provider_keys.set_user_provider_slot(u, "groq", 1, "GKEY")
+        result = await pill_id_service.identify_pill(b"img", "image/jpeg", user=u, db=None)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_leaflet_uses_vision_provider(self, monkeypatch):
+        u = _FakeUser()
+        provider_keys.set_user_provider_slot(u, "openrouter", 1, "ORKEY")
+
+        async def fake_vision(provider, prompt, image_b64, mime_type, api_key, **kw):
+            assert provider == "openrouter"
+            return "• اسم الدواء: بنادول\n• الجرعة: قرص كل 6 ساعات"
+
+        monkeypatch.setattr(provider_keys, "openai_compatible_vision", fake_vision)
+        result = await leaflet_service.summarize_leaflet(b"img", "image/jpeg", user=u, db=None)
+        assert result["is_configured"] is True
+        assert result["provider"] == "openrouter"
+        assert "بنادول" in result["summary"]

@@ -17,10 +17,9 @@ import json
 import re
 from typing import Optional
 
-import httpx
-
 from app.config import get_settings
 from app.services import llm_keys
+from app.services import provider_keys
 
 settings = get_settings()
 
@@ -54,65 +53,30 @@ IDENTIFY_PROMPT = (
 
 
 def is_configured(user=None) -> bool:
-    """True when at least one Gemini API key (user or server) is available."""
-    return bool(llm_keys.resolve_gemini_keys(user))
-
-
-def _gemini_generation_config(temperature: float) -> dict:
-    """
-    Build the Gemini generationConfig.
-
-    Thinking-capable models spend the output token budget on internal
-    reasoning by default, which can return empty text. We give a high token
-    budget and disable thinking so the tokens go to the actual answer.
-    (thinkingConfig is only valid on thinking-capable models, so it is
-    omitted for older ones.)
-    """
-    config = {"temperature": temperature, "maxOutputTokens": 8192}
-    if llm_keys.is_thinking_capable(settings.GEMINI_MODEL):
-        config["thinkingConfig"] = {"thinkingBudget": 0}
-    return config
+    """True when any vision-capable key (Gemini or a vision provider) is set."""
+    if llm_keys.resolve_gemini_keys(user):
+        return True
+    return any(
+        provider_keys.user_provider_keys(user, provider)
+        for provider in provider_keys.vision_providers()
+    )
 
 
 async def _call_gemini(image_b64: str, mime_type: str, api_key: str) -> str:
-    url = (
-        f"{settings.GEMINI_API_BASE}/models/{settings.GEMINI_MODEL}:generateContent"
-        f"?key={api_key}"
-    )
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": IDENTIFY_PROMPT},
-                    {"inline_data": {"mime_type": mime_type, "data": image_b64}},
-                ]
-            }
-        ],
-        "generationConfig": _gemini_generation_config(temperature=0.1),
-    }
-    async with httpx.AsyncClient(timeout=settings.LLM_TIMEOUT_SECONDS) as client:
-        response = await client.post(url, json=payload)
-    if response.status_code != 200:
-        raise PillIdError(f"Gemini API error {response.status_code}: {response.text[:200]}")
-    data = response.json()
+    """
+    Call Gemini for pill identification and return the raw JSON text.
 
-    # Input blocked by safety filters (no candidates returned at all).
-    block = (data.get("promptFeedback") or {}).get("blockReason")
-    if block:
-        raise PillIdError(f"Gemini blocked the request (promptFeedback: {block})")
-
-    candidates = data.get("candidates") or []
-    if not candidates:
-        raise PillIdError(f"Gemini returned no candidates: {str(data)[:200]}")
-
-    candidate = candidates[0]
-    parts = (candidate.get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts).strip()
-    if not text:
-        # e.g. finishReason SAFETY / MAX_TOKENS / RECITATION with no usable text.
-        finish = candidate.get("finishReason", "UNKNOWN")
-        raise PillIdError(f"Gemini returned empty text (finishReason: {finish})")
-    return text
+    Model fallback, error classification, timeouts and network errors are
+    handled centrally in ``llm_keys.gemini_generate``.
+    """
+    parts = [
+        {"text": IDENTIFY_PROMPT},
+        {"inline_data": {"mime_type": mime_type, "data": image_b64}},
+    ]
+    try:
+        return await llm_keys.gemini_generate(parts, api_key, temperature=0.1)
+    except llm_keys.GeminiError as e:
+        raise PillIdError(str(e))
 
 
 def _extract_json(text: str) -> dict:
@@ -182,24 +146,44 @@ async def identify_pill(
     Raises:
         PillIdError when every configured key fails or the reply is unparseable.
     """
-    keys = await llm_keys.resolve_gemini_keys_async(user, db)
-    if not keys:
+    gemini_keys = await llm_keys.resolve_gemini_keys_async(user, db)
+
+    # Vision failover providers (Pixtral / OpenRouter vision) — user, then
+    # admin-shared, then env keys.
+    vision_extra: list[tuple[str, str]] = []
+    for provider in provider_keys.vision_providers():
+        for key in await provider_keys.resolve_keys_async(provider, user, db):
+            vision_extra.append((provider, key))
+
+    if not gemini_keys and not vision_extra:
         return None
 
     model = settings.GEMINI_MODEL
     mime_type = content_type if (content_type or "").startswith("image/") else "image/jpeg"
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    try:
-        text = await llm_keys.call_with_failover(
-            keys, lambda key: _call_gemini(image_b64, mime_type, key)
-        )
-    except PillIdError:
-        raise
-    except Exception as e:  # noqa: BLE001 - normalise any failover error
-        raise PillIdError(str(e))
+    last_error: Optional[Exception] = None
 
-    parsed = _extract_json(text)
-    candidates = _normalize_candidates(parsed)
+    # 1) Gemini vision keys.
+    for key in gemini_keys:
+        try:
+            text = await _call_gemini(image_b64, mime_type, key)
+            return {"provider": "gemini", "model": model,
+                    "candidates": _normalize_candidates(_extract_json(text))}
+        except Exception as e:  # noqa: BLE001 - try the next key/provider
+            last_error = e
 
-    return {"provider": "gemini", "model": model, "candidates": candidates}
+    # 2) Extra vision providers (OpenAI-compatible).
+    for provider, key in vision_extra:
+        try:
+            text = await provider_keys.openai_compatible_vision(
+                provider, IDENTIFY_PROMPT, image_b64, mime_type, key
+            )
+            return {"provider": provider,
+                    "model": provider_keys.provider_vision_model(provider),
+                    "candidates": _normalize_candidates(_extract_json(text))}
+        except Exception as e:  # noqa: BLE001 - try the next key/provider
+            last_error = e
+
+    # Keys existed but all failed.
+    raise PillIdError(str(last_error) if last_error else "All vision keys failed.")

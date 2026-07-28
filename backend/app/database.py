@@ -94,6 +94,9 @@ _ADDED_USER_COLUMNS = {
     # status=PENDING from the SQLAlchemy model default at INSERT time instead.
     "role": "VARCHAR(10) DEFAULT 'USER'",
     "status": "VARCHAR(10) DEFAULT 'APPROVED'",
+    # Extra text-provider keys (Mistral/Groq/OpenRouter), stored as JSON.
+    # JSONB on Postgres, TEXT on SQLite (SQLAlchemy's JSON type reads both).
+    "provider_api_keys": "__JSON__",
 }
 
 
@@ -107,11 +110,14 @@ async def ensure_new_columns():
     from sqlalchemy import text
 
     is_postgres = settings.DATABASE_URL.startswith("postgresql")
+    # The JSON column has a per-dialect physical type.
+    json_type = "JSONB" if is_postgres else "TEXT"
     async with engine.begin() as conn:
         if is_postgres:
             for column, coltype in _ADDED_USER_COLUMNS.items():
+                sql_type = json_type if coltype == "__JSON__" else coltype
                 await conn.execute(
-                    text(f'ALTER TABLE users ADD COLUMN IF NOT EXISTS {column} {coltype}')
+                    text(f'ALTER TABLE users ADD COLUMN IF NOT EXISTS {column} {sql_type}')
                 )
         else:
             # SQLite has no "IF NOT EXISTS" for columns — introspect first.
@@ -119,8 +125,9 @@ async def ensure_new_columns():
             existing = {row[1] for row in result.fetchall()}
             for column, coltype in _ADDED_USER_COLUMNS.items():
                 if column not in existing:
+                    sql_type = json_type if coltype == "__JSON__" else coltype
                     await conn.execute(
-                        text(f"ALTER TABLE users ADD COLUMN {column} {coltype}")
+                        text(f"ALTER TABLE users ADD COLUMN {column} {sql_type}")
                     )
 
 

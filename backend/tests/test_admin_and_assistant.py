@@ -7,8 +7,11 @@ approves → can log in), server-side admin role enforcement, and the assistant
 endpoint's approved-user guard.
 """
 
+import json
 import pytest
 from httpx import AsyncClient
+
+from app.services import assistant_service
 
 
 class TestAdminApprovalFlow:
@@ -142,3 +145,54 @@ class TestAssistantGuard:
         data = response.json()
         assert data["is_configured"] is False
         assert data["recognized"] is False
+        # Comprehensive contract: all display fields present (empty when unknown).
+        for field in ("name", "activeIngredient", "uses", "dosage",
+                      "sideEffects", "warnings", "contraindications", "usageTimes"):
+            assert field in data
+        assert data["sideEffects"] == []
+        assert data["usageTimes"] == []
+        assert data["message"]  # a setup hint is provided
+
+    @pytest.mark.asyncio
+    async def test_assistant_returns_comprehensive_fields(
+        self, client: AsyncClient, test_user: dict, monkeypatch
+    ):
+        """With a (mocked) model reply, the endpoint returns the full drug profile."""
+        # Give the user a key so resolution is non-empty.
+        await client.put(
+            "/api/v1/users/me/ai-settings",
+            headers=test_user["auth_header"],
+            json={"gemini_api_key": "TEST-KEY"},
+        )
+
+        async def fake_ask(drug_name, api_key, model):
+            return json.dumps({
+                "name": "بنادول",
+                "activeIngredient": "باراسيتامول",
+                "uses": ["خفض الحرارة", "تسكين الألم"],
+                "dosage": ["قرص كل 6 ساعات"],
+                "sideEffects": ["غثيان", "طفح جلدي نادر"],
+                "warnings": ["لا تتجاوز 4 جرام يوميًا"],
+                "contraindications": ["فشل كبدي شديد"],
+                "usageTimes": ["صباحًا", "مساءً بعد الأكل"],
+                "recognized": True,
+            })
+
+        monkeypatch.setattr(assistant_service, "_ask_gemini", fake_ask)
+
+        r = await client.post(
+            "/api/v1/assistant/drug-info",
+            headers=test_user["auth_header"],
+            json={"name": "Panadol"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["recognized"] is True
+        assert data["name"] == "بنادول"
+        assert data["activeIngredient"] == "باراسيتامول"
+        assert data["uses"] == ["خفض الحرارة", "تسكين الألم"]
+        assert data["dosage"] == ["قرص كل 6 ساعات"]
+        assert data["sideEffects"] == ["غثيان", "طفح جلدي نادر"]
+        assert data["warnings"] == ["لا تتجاوز 4 جرام يوميًا"]
+        assert data["contraindications"] == ["فشل كبدي شديد"]
+        assert data["usageTimes"] == ["صباحًا", "مساءً بعد الأكل"]

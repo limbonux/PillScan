@@ -15,6 +15,9 @@ const STATUS_BADGE = {
   REJECTED: 'badge-error',
 };
 
+// Bump this when the admin panel changes so deploys are easy to verify at a glance.
+const PANEL_VERSION = 'v13';
+
 const AdminPage = {
   render() {
     return `
@@ -47,6 +50,10 @@ const AdminPage = {
             <div class="skeleton skeleton-card mb-3"></div>
           </div>
         </div>
+
+        <p class="text-center text-xs text-tertiary mb-6">
+          ${i18n.t('admin_version')}: <span dir="ltr">${PANEL_VERSION}</span>
+        </p>
       </div>
     `;
   },
@@ -83,6 +90,17 @@ const AdminPage = {
     if (!iso) return '';
     try {
       return new Date(iso).toLocaleDateString(i18n.lang === 'ar' ? 'ar-SA' : 'en-US');
+    } catch { return ''; }
+  },
+
+  fmtDateTime(iso) {
+    if (!iso) return '';
+    try {
+      const locale = i18n.lang === 'ar' ? 'ar-SA' : 'en-US';
+      return new Date(iso).toLocaleString(locale, {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
     } catch { return ''; }
   },
 
@@ -133,6 +151,7 @@ const AdminPage = {
 
     try {
       const users = await api.getUsers();
+      this.renderStats(users);
       if (!users.length) {
         container.innerHTML = `<p class="text-center text-secondary text-sm">${i18n.t('admin_no_users')}</p>`;
         return;
@@ -163,8 +182,203 @@ const AdminPage = {
       container.querySelectorAll('.status-select').forEach(sel =>
         sel.addEventListener('change', () => this.changeStatus(sel.dataset.id, sel.value)));
     } catch (err) {
+      this.renderStats([]);
       container.innerHTML = `<p class="text-center text-secondary text-sm">${err.message || i18n.t('error_generic')}</p>`;
     }
+  },
+
+  renderStats(users) {
+    const el = document.getElementById('admin-stats');
+    if (!el) return;
+    const by = (s) => users.filter(u => u.status === s).length;
+    const cards = [
+      { label: 'admin_stat_total', value: users.length, cls: 'stat-total' },
+      { label: 'admin_stat_pending', value: by('PENDING'), cls: 'stat-warning' },
+      { label: 'admin_stat_approved', value: by('APPROVED'), cls: 'stat-success' },
+      { label: 'admin_stat_rejected', value: by('REJECTED'), cls: 'stat-error' },
+    ];
+    el.className = 'grid grid-2 gap-3';
+    el.innerHTML = cards.map(c => `
+      <div class="stat-box ${c.cls}">
+        <div class="stat-number">${c.value}</div>
+        <div class="stat-label">${i18n.t(c.label)}</div>
+      </div>`).join('');
+  },
+
+  async loadActivityStats() {
+    const el = document.getElementById('admin-activity');
+    if (!el) return;
+
+    const cards = [
+      { icon: '📷', label: 'admin_stat_scans', key: 'scans' },
+      { icon: '💊', label: 'admin_stat_medications', key: 'medications' },
+      { icon: '⏰', label: 'admin_stat_reminders', key: 'reminders' },
+      { icon: '💬', label: 'admin_stat_queries', key: 'queries' },
+    ];
+
+    try {
+      const s = await api.getAdminStats();
+      el.className = 'grid grid-2 gap-3';
+      el.innerHTML = cards.map(c => `
+        <div class="stat-box stat-total">
+          <div class="text-xl mb-1">${c.icon}</div>
+          <div class="stat-number">${Number(s?.[c.key] ?? 0)}</div>
+          <div class="stat-label">${i18n.t(c.label)}</div>
+        </div>`).join('');
+      // The trend chart is fed by the same response — render it here too.
+      this.renderScanTrend(Array.isArray(s?.scan_trend) ? s.scan_trend : []);
+    } catch (err) {
+      el.className = '';
+      el.innerHTML = `<p class="text-center text-secondary text-sm">${err.message || i18n.t('error_generic')}</p>`;
+      this.renderScanTrend(null);
+    }
+  },
+
+  renderScanTrend(trend) {
+    const el = document.getElementById('scan-trend');
+    if (!el) return;
+
+    if (trend === null) {
+      el.innerHTML = `<p class="text-center text-secondary text-sm">${i18n.t('error_generic')}</p>`;
+      return;
+    }
+
+    const locale = i18n.lang === 'ar' ? 'ar-SA' : 'en-US';
+    const weekday = (iso) => {
+      // Parse at local noon so the weekday never shifts across time zones.
+      try { return new Date(`${iso}T12:00:00`).toLocaleDateString(locale, { weekday: 'short' }); }
+      catch { return ''; }
+    };
+    const max = trend.reduce((m, d) => Math.max(m, Number(d.count) || 0), 0);
+
+    if (!max) {
+      el.innerHTML = `
+        <div class="card">
+          <p class="text-center text-secondary text-sm">${i18n.t('admin_scan_trend_empty')}</p>
+        </div>`;
+      return;
+    }
+
+    const cols = trend.map(d => {
+      const count = Number(d.count) || 0;
+      const pct = Math.round((count / max) * 100);
+      return `
+        <div class="trend-col">
+          <div class="trend-count">${count}</div>
+          <div class="trend-bar ${count === 0 ? 'is-empty' : ''}" style="height:${count === 0 ? 0 : Math.max(pct, 8)}%;"></div>
+          <div class="trend-label">${weekday(d.date)}</div>
+        </div>`;
+    }).join('');
+
+    el.innerHTML = `<div class="card"><div class="trend-chart">${cols}</div></div>`;
+  },
+
+  // Escape user-controlled text before interpolating into innerHTML.
+  esc(str) {
+    return String(str ?? '').replace(/[&<>"']/g, ch => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+    ));
+  },
+
+  async loadQueriesByUser() {
+    const container = document.getElementById('queries-by-user');
+    if (!container) return;
+
+    try {
+      const data = await api.getQueryStatsByUser();
+      const users = Array.isArray(data?.users) ? data.users : [];
+
+      if (!users.length) {
+        container.innerHTML = `<div class="empty-state"><div class="text-4xl mb-2">💬</div><p class="text-secondary text-sm">${i18n.t('admin_queries_none')}</p></div>`;
+        return;
+      }
+
+      container.innerHTML = users.map(u => {
+        const name = this.esc(u.full_name || '-');
+        const initial = name.charAt(0) || 'U';
+        const uid = this.esc(u.user_id || '');
+        return `
+        <div class="card animate-fade-in-up mb-3 query-user" data-user-id="${uid}">
+          <div class="flex items-center gap-3 query-user-row" role="button" tabindex="0" aria-expanded="false">
+            <div class="avatar avatar-md" style="background:var(--color-primary-gradient);">${initial}</div>
+            <div class="flex-1">
+              <h4 class="font-semibold text-sm">${name}</h4>
+              <p class="text-xs text-tertiary" dir="ltr">${this.esc(u.email || '')}</p>
+              <p class="text-xs text-secondary mt-1">
+                ${Number(u.recognized) || 0} ${i18n.t('admin_queries_recognized')}
+                · ${i18n.t('admin_queries_last')}: ${this.fmtDate(u.last_at)}
+              </p>
+            </div>
+            <span class="badge badge-primary text-xs">${Number(u.total) || 0} ${i18n.t('admin_queries_count')}</span>
+            <svg class="query-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>
+          </div>
+          <div class="query-detail" hidden></div>
+        </div>`;
+      }).join('');
+
+      container.querySelectorAll('.query-user-row').forEach(row => {
+        const card = row.closest('.query-user');
+        row.addEventListener('click', () => this.toggleUserQueries(card));
+        row.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.toggleUserQueries(card); }
+        });
+      });
+    } catch (err) {
+      container.innerHTML = `<p class="text-center text-secondary text-sm">${err.message || i18n.t('error_generic')}</p>`;
+    }
+  },
+
+  async toggleUserQueries(card) {
+    if (!card) return;
+    const detail = card.querySelector('.query-detail');
+    const row = card.querySelector('.query-user-row');
+    if (!detail) return;
+
+    // Collapse if already open.
+    if (!detail.hidden) {
+      detail.hidden = true;
+      card.classList.remove('is-expanded');
+      row?.setAttribute('aria-expanded', 'false');
+      return;
+    }
+
+    // Expand.
+    detail.hidden = false;
+    card.classList.add('is-expanded');
+    row?.setAttribute('aria-expanded', 'true');
+
+    // Lazy-load once.
+    if (detail.dataset.loaded === '1') return;
+    detail.innerHTML = `<div class="skeleton skeleton-text mt-3"></div>`;
+    try {
+      const data = await api.getUserQueries(card.dataset.userId);
+      const queries = Array.isArray(data?.queries) ? data.queries : [];
+      detail.innerHTML = this.renderQueryDetail(queries);
+      detail.dataset.loaded = '1';
+    } catch (err) {
+      detail.innerHTML = `<p class="text-center text-secondary text-xs mt-3">${err.message || i18n.t('error_generic')}</p>`;
+    }
+  },
+
+  renderQueryDetail(queries) {
+    if (!queries.length) {
+      return `<p class="text-center text-secondary text-xs mt-3">${i18n.t('admin_queries_detail_empty')}</p>`;
+    }
+    return `<div class="query-detail-list mt-3">` + queries.map(q => {
+      const recognized = q.recognized === true;
+      const badgeCls = recognized ? 'badge-success' : 'badge-warning';
+      const badgeTxt = recognized ? i18n.t('admin_queries_recognized') : i18n.t('admin_queries_not_recognized');
+      const resolved = recognized && q.recognized_name
+        ? ` · → <span class="font-semibold">${this.esc(q.recognized_name)}</span>` : '';
+      return `
+        <div class="query-item">
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-sm font-medium">${this.esc(q.query_text || '-')}</span>
+            <span class="badge ${badgeCls} text-xs">${badgeTxt}</span>
+          </div>
+          <p class="text-xs text-tertiary mt-1">${this.fmtDateTime(q.created_at)}${resolved}</p>
+        </div>`;
+    }).join('') + `</div>`;
   },
 
   async changeStatus(userId, status) {

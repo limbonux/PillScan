@@ -9,13 +9,18 @@ Every endpoint depends on ``get_current_admin`` so access is enforced on the
 
 from uuid import UUID
 from typing import Optional
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, case
 
 from app.database import get_db
 from app.models.user import User
+from app.models.scan_history import ScanHistory
+from app.models.medication import Medication
+from app.models.reminder import Reminder
+from app.models.user_query import UserQuery
 from app.schemas.user import AdminUserResponse, UpdateUserStatusRequest
 from app.services.auth_service import get_current_admin
 from app.config import get_settings

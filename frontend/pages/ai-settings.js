@@ -12,9 +12,17 @@ import toast from '../components/toast.js';
 
 const KEY_SLOTS = 5;
 
+// "Get a key" links for the extra text providers.
+const PROVIDER_LINKS = {
+  mistral: 'https://console.mistral.ai/api-keys',
+  groq: 'https://console.groq.com/keys',
+  openrouter: 'https://openrouter.ai/keys',
+};
+
 const AISettingsPage = {
   // Current server-side status (which key slots are configured). Loaded on mount.
   status: null,
+  providerStatus: null,
 
   render() {
     return `
@@ -41,7 +49,13 @@ const AISettingsPage = {
   async load() {
     const container = document.getElementById('ai-settings-container');
     try {
-      this.status = await api.getAISettings();
+      // Provider status is best-effort — a failure there must not block Gemini.
+      const [status, providerStatus] = await Promise.all([
+        api.getAISettings(),
+        api.getProviderKeys().catch(() => null),
+      ]);
+      this.status = status;
+      this.providerStatus = providerStatus;
       container.innerHTML = this.formHtml();
       this.bindForm();
     } catch (error) {
@@ -127,7 +141,65 @@ const AISettingsPage = {
         <div class="loading-dots hidden" id="ai-test-loading"><span></span><span></span><span></span></div>
       </button>
       <div id="ai-test-result" class="mt-3"></div>
+
+      ${this.providersHtml()}
     `;
+  },
+
+  esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+  },
+
+  /** The extra text-provider section (Mistral / Groq / OpenRouter). */
+  providersHtml() {
+    const ps = this.providerStatus;
+    if (!ps || !Array.isArray(ps.providers)) return '';
+
+    const cards = ps.providers.map(p => {
+      const link = PROVIDER_LINKS[p.provider] || '#';
+      const slots = (p.keys || []).map(k => this.providerSlotHtml(p.provider, k)).join('');
+      return `
+        <div class="card mb-3 provider-card" data-provider="${this.esc(p.provider)}">
+          <div class="flex items-center justify-between provider-head" role="button" tabindex="0" style="cursor:pointer;">
+            <div class="flex items-center gap-2">
+              <h3 class="font-semibold">${this.esc(p.label)}</h3>
+              <span class="badge ${p.configured_count ? 'badge-success' : 'badge-muted'} text-xs">
+                ${p.configured_count}/${ps.slots_per_provider} ${i18n.t('ai_provider_slots_configured')}
+              </span>
+            </div>
+            <svg class="provider-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>
+          </div>
+          <div class="provider-body" hidden>
+            <p class="text-xs text-tertiary mt-2 mb-2"><span dir="ltr">${this.esc(p.model)}</span></p>
+            <a href="${link}" target="_blank" rel="noopener" class="auth-link text-xs" style="display:inline-block;margin-bottom:8px;">${i18n.t('ai_get_key')} ↗</a>
+            ${slots}
+          </div>
+        </div>`;
+    }).join('');
+
+    return `
+      <div class="mt-6 mb-3">
+        <h2 class="font-bold text-base mb-1">${i18n.t('ai_providers_title')}</h2>
+        <p class="text-xs text-secondary" style="line-height:1.7;">${i18n.t('ai_providers_intro')}</p>
+      </div>
+      ${cards}
+    `;
+  },
+
+  /** One provider key slot (input + save; masked hint + clear when set). */
+  providerSlotHtml(provider, k) {
+    const id = `${provider}-${k.slot}`;
+    return `
+      <div class="flex items-center gap-2 mb-2 provider-slot" data-provider="${this.esc(provider)}" data-slot="${k.slot}">
+        <span class="text-xs text-tertiary" style="width:20px;flex-shrink:0;">${k.slot}</span>
+        <div class="input-field flex-1" style="margin:0;">
+          <input type="password" id="pk-${id}" placeholder="${k.configured ? (this.esc(k.hint) || '••••••••') : i18n.t('ai_key_placeholder')}" autocomplete="off" dir="ltr">
+        </div>
+        <button type="button" class="btn btn-primary btn-sm pk-save" data-provider="${this.esc(provider)}" data-slot="${k.slot}">${i18n.t('save')}</button>
+        ${k.configured ? `<button type="button" class="btn btn-ghost btn-sm pk-clear" data-provider="${this.esc(provider)}" data-slot="${k.slot}" style="color:var(--color-error);">✕</button>` : ''}
+      </div>`;
   },
 
   bindForm() {
@@ -137,6 +209,54 @@ const AISettingsPage = {
     }
     document.getElementById('ai-save-btn')?.addEventListener('click', () => this.save());
     document.getElementById('ai-test-btn')?.addEventListener('click', () => this.testKeys());
+    this.bindProviders();
+  },
+
+  bindProviders() {
+    // Accordion toggle per provider.
+    document.querySelectorAll('.provider-card').forEach(card => {
+      const head = card.querySelector('.provider-head');
+      const body = card.querySelector('.provider-body');
+      const toggle = () => {
+        const open = body.hidden;
+        body.hidden = !open;
+        card.classList.toggle('is-open', open);
+      };
+      head?.addEventListener('click', toggle);
+      head?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+      });
+    });
+    // Save / clear per slot.
+    document.querySelectorAll('.pk-save').forEach(btn =>
+      btn.addEventListener('click', () => this.saveProviderSlot(btn.dataset.provider, Number(btn.dataset.slot))));
+    document.querySelectorAll('.pk-clear').forEach(btn =>
+      btn.addEventListener('click', () => this.saveProviderSlot(btn.dataset.provider, Number(btn.dataset.slot), '')));
+  },
+
+  async saveProviderSlot(provider, slot, forcedValue) {
+    const input = document.getElementById(`pk-${provider}-${slot}`);
+    const value = forcedValue !== undefined ? forcedValue : (input?.value.trim() || '');
+    // Nothing typed and not an explicit clear → ignore.
+    if (forcedValue === undefined && !value) { toast.info(i18n.t('ai_no_changes')); return; }
+    try {
+      this.providerStatus = await api.updateProviderKey(provider, slot, value);
+      toast.success(i18n.t(forcedValue === '' ? 'ai_key_cleared' : 'ai_key_saved'));
+      this.rerenderKeepingProvidersOpen(provider);
+    } catch (error) {
+      toast.error(error.message || i18n.t('error_generic'));
+    }
+  },
+
+  // Re-render the form but keep the just-edited provider's section expanded.
+  rerenderKeepingProvidersOpen(openProvider) {
+    document.getElementById('ai-settings-container').innerHTML = this.formHtml();
+    this.bindForm();
+    if (openProvider) {
+      const card = document.querySelector(`.provider-card[data-provider="${openProvider}"]`);
+      const body = card?.querySelector('.provider-body');
+      if (body) { body.hidden = false; card.classList.add('is-open'); }
+    }
   },
 
   /** Live-test the saved keys and render a per-key status list (mobile-friendly) */

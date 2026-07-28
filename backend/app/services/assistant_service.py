@@ -16,10 +16,9 @@ import json
 import re
 from typing import Any, Optional
 
-import httpx
-
 from app.config import get_settings
 from app.services import llm_keys
+from app.services import provider_keys
 
 settings = get_settings()
 
@@ -28,17 +27,29 @@ class AssistantServiceError(Exception):
     """Raised when the assistant LLM call fails on every configured key."""
 
 
-# System prompt — Arabic, JSON-only, with strict safety rules. Kept verbatim as
-# the product spec requires.
+# System prompt — Arabic, JSON-only, COMPREHENSIVE drug information. The model
+# is asked to recognise common brand & generic medications (Gulf/Arab region and
+# worldwide) and return a full profile, not just three fields.
 SYSTEM_PROMPT_AR = (
-    "أنت مساعد دوائي متخصص تُجيب بالعربية. قدّم معلومات دوائية عامة وموثوقة عن "
-    "الدواء المطلوب بصيغة JSON بالحقول: name، uses (دواعي الاستعمال)، dosage "
-    "(الجرعة الاعتيادية)، sideEffects (مصفوفة)، contraindications (مصفوفة)، "
-    "interactions (مصفوفة تفاعلات دوائية مهمة)، storage (طريقة التخزين)، warnings "
-    "(مصفوفة تحذيرات)، recognized (true/false). قواعد صارمة: لا تقدّم تشخيصاً ولا "
-    "تصف علاجاً لحالة بعينها؛ إن لم تتعرّف على الدواء أو لم تكن متأكداً اجعل "
-    "recognized=false ووضّح ذلك بدل اختلاق معلومات؛ لا تشجّع على إساءة الاستخدام "
-    "أو الجرعات الزائدة. أعد JSON فقط دون أي نص إضافي."
+    "أنت مساعد دوائي خبير تُجيب بالعربية الفصحى المبسّطة. عند إعطائك اسم دواء "
+    "(تجاري أو علمي، عربي أو إنجليزي، وقد يكون مكتوباً بأخطاء إملائية بسيطة) قدّم "
+    "معلومات دوائية عامة وموثوقة وشاملة عنه بصيغة JSON فقط، وبهذه الحقول وبهذا "
+    "الترتيب:\n"
+    "1) name: الاسم الصحيح للدواء (نص).\n"
+    "2) activeIngredient: المادة الفعّالة الرئيسية (نص).\n"
+    "3) uses: دواعي الاستعمال والاستخدامات (مصفوفة نصية).\n"
+    "4) dosage: الجرعة المعتادة للبالغين وطريقة الاستخدام (مصفوفة نصية).\n"
+    "5) sideEffects: الأعراض الجانبية المحتملة (مصفوفة نصية).\n"
+    "6) warnings: تحذيرات واحتياطات مهمة (مصفوفة نصية).\n"
+    "7) contraindications: موانع الاستعمال (متى يُمنع استخدامه) (مصفوفة نصية).\n"
+    "8) usageTimes: أوقات/مواعيد الاستخدام المعتادة (مصفوفة نصية، مثل: صباحًا، "
+    "بعد الأكل).\n"
+    "9) recognized: true إذا تعرّفت على الدواء، أو false فقط إذا لم يكن الاسم "
+    "دواءً معروفاً إطلاقاً.\n"
+    "قواعد: تعرّف على الأدوية الشائعة وأسمائها التجارية قدر الإمكان وصحّح الأخطاء "
+    "الإملائية البسيطة في الاسم؛ املأ كل حقل بما تعرفه ولا تتركه فارغاً بلا سبب؛ "
+    "لا تقدّم تشخيصاً لحالة فردية؛ لا تختلق معلومات غير صحيحة؛ لا تشجّع على إساءة "
+    "الاستخدام أو الجرعات الزائدة. أعد JSON فقط دون أي نص إضافي خارج الكائن."
 )
 
 # Shown as a persistent banner above the result (added by the API, not the model).
@@ -54,68 +65,27 @@ NOT_CONFIGURED_MESSAGE_AR = (
 
 
 def is_configured(user: Optional[Any] = None) -> bool:
-    """True when at least one Gemini key (user or server) is available."""
-    return bool(llm_keys.resolve_gemini_keys(user))
-
-
-def _generation_config(model: str, temperature: float) -> dict:
-    """
-    Build the Gemini generationConfig — kept identical in shape to the working
-    pill-ID / leaflet services (which this app already relies on). Notably it
-    does NOT set ``responseMimeType``: that field is rejected by the model this
-    app uses and made every key fail. JSON is requested via the prompt instead
-    and parsed defensively below. Thinking-capable models get thinking disabled
-    so the token budget produces the actual answer rather than internal reasoning.
-    """
-    config = {"temperature": temperature, "maxOutputTokens": 8192}
-    if llm_keys.is_thinking_capable(model):
-        config["thinkingConfig"] = {"thinkingBudget": 0}
-    return config
+    """True when at least one key (Gemini or an extra text provider) is available."""
+    if llm_keys.resolve_gemini_keys(user):
+        return True
+    return any(
+        provider_keys.user_provider_keys(user, provider)
+        for provider in provider_keys.ordered_providers()
+    )
 
 
 async def _ask_gemini(drug_name: str, api_key: str, model: str) -> str:
-    """Call Gemini generateContent (text only) and return the raw text."""
-    url = (
-        f"{settings.GEMINI_API_BASE}/models/{model}:generateContent"
-        f"?key={api_key}"
-    )
-    config = _generation_config(model, temperature=0.2)
+    """
+    Call Gemini (text only) and return the raw JSON text.
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": SYSTEM_PROMPT_AR},
-                    {"text": f"اسم الدواء: {drug_name}"},
-                ]
-            }
-        ],
-        "generationConfig": config,
-    }
-
-    async with httpx.AsyncClient(timeout=settings.LLM_TIMEOUT_SECONDS) as client:
-        response = await client.post(url, json=payload)
-
-    if response.status_code != 200:
-        raise AssistantServiceError(
-            f"Gemini API error {response.status_code}: {response.text[:300]}"
-        )
-
-    data = response.json()
-    block = (data.get("promptFeedback") or {}).get("blockReason")
-    if block:
-        raise AssistantServiceError(f"Gemini blocked the request ({block})")
-
-    candidates = data.get("candidates") or []
-    if not candidates:
-        raise AssistantServiceError(f"Gemini returned no candidates: {str(data)[:200]}")
-
-    parts = (candidates[0].get("content") or {}).get("parts") or []
-    text = "".join(part.get("text", "") for part in parts).strip()
-    if not text:
-        finish = candidates[0].get("finishReason", "UNKNOWN")
-        raise AssistantServiceError(f"Gemini returned empty text (finishReason: {finish})")
-    return text
+    Model fallback, error classification, timeouts and network errors are
+    handled centrally in ``llm_keys.gemini_generate``.
+    """
+    parts = [
+        {"text": SYSTEM_PROMPT_AR},
+        {"text": f"اسم الدواء: {drug_name}"},
+    ]
+    return await llm_keys.gemini_generate(parts, api_key, temperature=0.2)
 
 
 def _parse_json(text: str) -> Optional[dict]:
@@ -150,67 +120,124 @@ def _as_list(value: Any) -> list:
     return [str(value).strip()]
 
 
+def _as_text(value: Any) -> str:
+    """Coerce a field into a trimmed string (join lists), or '' if empty."""
+    if isinstance(value, list):
+        return "، ".join(str(v).strip() for v in value if str(v).strip())
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def _normalize(parsed: dict, drug_name: str, model: str) -> dict:
-    """Shape the parsed model output into the response contract."""
+    """
+    Shape the parsed model output into the comprehensive drug-info contract.
+    Missing or wrongly-typed fields are coerced safely so the response is ALWAYS
+    valid. A recognised reply is kept as long as it carries *any* substantive
+    content, so real medications are no longer wrongly rejected.
+    """
+    recognized = bool(parsed.get("recognized", False))
+
+    active_ingredient = _as_text(parsed.get("activeIngredient"))
+    uses = _as_list(parsed.get("uses"))
+    dosage = _as_list(parsed.get("dosage"))
+    side_effects = _as_list(parsed.get("sideEffects"))
+    warnings = _as_list(parsed.get("warnings"))
+    contraindications = _as_list(parsed.get("contraindications"))
+    usage_times = _as_list(parsed.get("usageTimes"))
+
+    # Only flip to "not recognised" when the reply is genuinely empty of any
+    # substantive content — otherwise trust the model. (Previously a missing
+    # sideEffects+usageTimes pair wrongly rejected real drugs.)
+    has_content = any([
+        active_ingredient, uses, dosage, side_effects, warnings,
+        contraindications, usage_times,
+    ])
+    if recognized and not has_content:
+        recognized = False
+
     return {
         "name": str(parsed.get("name") or drug_name).strip(),
-        "uses": str(parsed.get("uses") or "").strip(),
-        "dosage": str(parsed.get("dosage") or "").strip(),
-        "sideEffects": _as_list(parsed.get("sideEffects")),
-        "contraindications": _as_list(parsed.get("contraindications")),
-        "interactions": _as_list(parsed.get("interactions")),
-        "storage": str(parsed.get("storage") or "").strip(),
-        "warnings": _as_list(parsed.get("warnings")),
-        "recognized": bool(parsed.get("recognized", False)),
+        "activeIngredient": active_ingredient,
+        "uses": uses,
+        "dosage": dosage,
+        "sideEffects": side_effects,
+        "warnings": warnings,
+        "contraindications": contraindications,
+        "usageTimes": usage_times,
+        "recognized": recognized,
         "provider": "gemini",
         "model": model,
         "is_configured": True,
         "disclaimer_ar": DISCLAIMER_AR,
+        "message": "" if recognized else "لم يتم التعرف على هذا الدواء بشكل مؤكد.",
     }
 
 
 async def get_drug_info(drug_name: str, user: Optional[Any] = None, db: Any = None) -> dict:
     """
-    Look up general drug information for ``drug_name`` via Gemini.
+    Look up comprehensive drug information for ``drug_name`` via Gemini and return
+    it (name, activeIngredient, uses, dosage, sideEffects, warnings,
+    contraindications, usageTimes).
 
     Uses the requesting user's own keys, then admin-shared keys (when ``db`` is
-    provided), then server env keys. Returns a dict matching ``DrugInfoResponse``.
-    Never raises for the "not configured" or "unparseable" cases — it returns
-    recognized=False with a clear message instead. Raises
-    ``AssistantServiceError`` only if every configured key errored.
+    provided), then server env keys. Never raises for the "not configured",
+    "provider error", or "unparseable" cases — it returns recognized=False with a
+    clear ``message`` instead, so the endpoint always degrades gracefully.
     """
     model = settings.GEMINI_MODEL
     base = {
         "name": drug_name,
-        "uses": "",
-        "dosage": "",
+        "activeIngredient": "",
+        "uses": [],
+        "dosage": [],
         "sideEffects": [],
-        "contraindications": [],
-        "interactions": [],
-        "storage": "",
         "warnings": [],
+        "contraindications": [],
+        "usageTimes": [],
         "recognized": False,
         "provider": "gemini",
         "model": model,
         "disclaimer_ar": DISCLAIMER_AR,
+        "message": "",
     }
 
-    keys = await llm_keys.resolve_gemini_keys_async(user, db)
-    if not keys:
-        return {**base, "is_configured": False, "warnings": [NOT_CONFIGURED_MESSAGE_AR]}
+    gemini_keys = await llm_keys.resolve_gemini_keys_async(user, db)
 
-    raw = await llm_keys.call_with_failover(
-        keys, lambda key: _ask_gemini(drug_name, key, model)
-    )
+    # Extra text providers (Mistral / Groq / OpenRouter) as failover: user keys,
+    # then admin-shared, then server env — tried after Gemini is exhausted.
+    extra: list[tuple[str, str]] = []
+    for provider in provider_keys.ordered_providers():
+        for key in await provider_keys.resolve_keys_async(provider, user, db):
+            extra.append((provider, key))
 
-    parsed = _parse_json(raw)
-    if parsed is None:
-        # Network/API succeeded but the reply wasn't valid JSON — clear fallback.
-        return {
-            **base,
-            "is_configured": True,
-            "recognized": False,
-            "warnings": ["تعذّر تحليل رد المساعد. حاول مرة أخرى."],
-        }
+    if not gemini_keys and not extra:
+        return {**base, "is_configured": False, "message": NOT_CONFIGURED_MESSAGE_AR}
 
-    return _normalize(parsed, drug_name, model)
+    user_prompt = f"اسم الدواء: {drug_name}"
+
+    # 1) Gemini first (native call — also does per-key model fallback). The first
+    #    key that returns parseable JSON wins.
+    for key in gemini_keys:
+        try:
+            raw = await _ask_gemini(drug_name, key, model)
+        except Exception:  # noqa: BLE001 - try the next key/provider
+            continue
+        parsed = _parse_json(raw)
+        if parsed is not None:
+            return _normalize(parsed, drug_name, model)
+
+    # 2) Extra OpenAI-compatible providers, in registry order.
+    for provider, key in extra:
+        try:
+            raw = await provider_keys.openai_compatible_generate(
+                provider, SYSTEM_PROMPT_AR, user_prompt, key
+            )
+        except Exception:  # noqa: BLE001 - try the next key/provider
+            continue
+        parsed = _parse_json(raw)
+        if parsed is not None:
+            return _normalize(parsed, drug_name, provider_keys.provider_model(provider))
+
+    # Every key across every provider failed or returned unparseable output.
+    return {**base, "is_configured": True, "message": "تعذّر جلب معلومات الدواء. حاول مرة أخرى."}

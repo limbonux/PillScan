@@ -43,13 +43,27 @@ class Settings(BaseSettings):
     # or fails, the next is used.
     LLM_TIMEOUT_SECONDS: int = 60
 
-    GEMINI_MODEL: str = "gemini-3.5-flash"
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    # If the primary model returns 404 (not available on the caller's key/region),
+    # these are tried in order so identification keeps working instead of failing.
+    GEMINI_MODEL_FALLBACKS: list[str] = [
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+    ]
     GEMINI_API_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_API_KEY_2: Optional[str] = None
     GEMINI_API_KEY_3: Optional[str] = None
     GEMINI_API_KEY_4: Optional[str] = None
     GEMINI_API_KEY_5: Optional[str] = None
+
+    # ── Extra text providers (assistant failover) — optional server keys ──
+    # In-app keys (admin-shared) are the main path; these env keys are an
+    # optional server-wide fallback. See app.services.provider_keys.
+    MISTRAL_API_KEY: Optional[str] = None
+    GROQ_API_KEY: Optional[str] = None
+    OPENROUTER_API_KEY: Optional[str] = None
 
     # ── AWS S3 (Image Storage) ───────────────────────────────────────────
     AWS_ACCESS_KEY_ID: Optional[str] = None

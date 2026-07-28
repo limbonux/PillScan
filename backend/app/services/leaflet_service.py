@@ -19,10 +19,9 @@ can still be demonstrated offline without fabricating medical content.
 import base64
 from typing import Any, Optional
 
-import httpx
-
 from app.config import get_settings
 from app.services import llm_keys
+from app.services import provider_keys
 
 settings = get_settings()
 
@@ -81,68 +80,32 @@ def _guess_ext_mime(content_type: Optional[str]) -> str:
     return "image/jpeg"
 
 
-def _gemini_generation_config(model: str, temperature: float) -> dict:
-    """
-    Build the Gemini generationConfig.
-
-    Thinking-capable models "think" by default, spending the output token
-    budget on internal reasoning and sometimes returning empty text. Give a
-    high budget and disable thinking so the tokens produce the actual
-    summary. (thinkingConfig is only valid on thinking-capable models.)
-    """
-    config = {"temperature": temperature, "maxOutputTokens": 8192}
-    if llm_keys.is_thinking_capable(model):
-        config["thinkingConfig"] = {"thinkingBudget": 0}
-    return config
-
-
 async def _summarize_with_gemini(image_b64: str, mime_type: str, api_key: str, model: str) -> str:
-    """Call Google Gemini's generateContent endpoint and return the text."""
-    url = (
-        f"{settings.GEMINI_API_BASE}/models/{model}:generateContent"
-        f"?key={api_key}"
-    )
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": SUMMARY_PROMPT_AR},
-                    {"inline_data": {"mime_type": mime_type, "data": image_b64}},
-                ]
-            }
-        ],
-        "generationConfig": _gemini_generation_config(model, temperature=0.2),
-    }
+    """
+    Call Gemini and return the Arabic summary text.
 
-    async with httpx.AsyncClient(timeout=settings.LLM_TIMEOUT_SECONDS) as client:
-        response = await client.post(url, json=payload)
-
-    if response.status_code != 200:
-        raise LeafletServiceError(
-            f"Gemini API error {response.status_code}: {response.text[:300]}"
-        )
-
-    data = response.json()
-
-    block = (data.get("promptFeedback") or {}).get("blockReason")
-    if block:
-        raise LeafletServiceError(f"Gemini blocked the request (promptFeedback: {block})")
-
-    candidates = data.get("candidates") or []
-    if not candidates:
-        raise LeafletServiceError(f"Gemini returned no candidates: {str(data)[:300]}")
-
-    parts = (candidates[0].get("content") or {}).get("parts") or []
-    text = "".join(part.get("text", "") for part in parts).strip()
-    if not text:
-        finish = candidates[0].get("finishReason", "UNKNOWN")
-        raise LeafletServiceError(f"Gemini returned an empty summary (finishReason: {finish})")
-    return text
+    The heavy lifting (model fallback, error classification, timeouts, network
+    errors) lives in ``llm_keys.gemini_generate``; the ``model`` argument is kept
+    for backward compatibility but model selection is handled centrally there.
+    """
+    parts = [
+        {"text": SUMMARY_PROMPT_AR},
+        {"inline_data": {"mime_type": mime_type, "data": image_b64}},
+    ]
+    try:
+        return await llm_keys.gemini_generate(parts, api_key, temperature=0.2)
+    except llm_keys.GeminiError as e:
+        raise LeafletServiceError(str(e))
 
 
 def is_configured(user: Optional[Any] = None) -> bool:
-    """True when at least one Gemini key (user or server) is available."""
-    return bool(llm_keys.resolve_gemini_keys(user))
+    """True when any vision-capable key (Gemini or a vision provider) is set."""
+    if llm_keys.resolve_gemini_keys(user):
+        return True
+    return any(
+        provider_keys.user_provider_keys(user, provider)
+        for provider in provider_keys.vision_providers()
+    )
 
 
 async def summarize_leaflet(
@@ -177,8 +140,15 @@ async def summarize_leaflet(
         "disclaimer_en": DISCLAIMER_EN,
     }
 
-    keys = await llm_keys.resolve_gemini_keys_async(user, db)
-    if not keys:
+    gemini_keys = await llm_keys.resolve_gemini_keys_async(user, db)
+
+    # Vision failover providers (Pixtral / OpenRouter vision).
+    vision_extra: list = []
+    for provider in provider_keys.vision_providers():
+        for key in await provider_keys.resolve_keys_async(provider, user, db):
+            vision_extra.append((provider, key))
+
+    if not gemini_keys and not vision_extra:
         return {
             **base_result,
             "summary": NOT_CONFIGURED_MESSAGE_AR,
@@ -188,13 +158,30 @@ async def summarize_leaflet(
     mime_type = _guess_ext_mime(content_type)
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    try:
-        summary = await llm_keys.call_with_failover(
-            keys, lambda key: _summarize_with_gemini(image_b64, mime_type, key, model)
-        )
-    except LeafletServiceError:
-        raise
-    except Exception as e:  # noqa: BLE001 - normalise any failover error
-        raise LeafletServiceError(str(e))
+    last_error: Optional[Exception] = None
 
-    return {**base_result, "summary": summary, "is_configured": True}
+    # 1) Gemini vision keys.
+    for key in gemini_keys:
+        try:
+            summary = await _summarize_with_gemini(image_b64, mime_type, key, model)
+            return {**base_result, "summary": summary, "is_configured": True}
+        except Exception as e:  # noqa: BLE001 - try the next key/provider
+            last_error = e
+
+    # 2) Extra vision providers (OpenAI-compatible).
+    for provider, key in vision_extra:
+        try:
+            summary = await provider_keys.openai_compatible_vision(
+                provider, SUMMARY_PROMPT_AR, image_b64, mime_type, key
+            )
+            return {
+                **base_result,
+                "provider": provider,
+                "model": provider_keys.provider_vision_model(provider),
+                "summary": summary,
+                "is_configured": True,
+            }
+        except Exception as e:  # noqa: BLE001 - try the next key/provider
+            last_error = e
+
+    raise LeafletServiceError(str(last_error) if last_error else "All vision keys failed.")

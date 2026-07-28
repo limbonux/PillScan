@@ -32,40 +32,6 @@ const AdminPage = {
         <!-- Storage status -->
         <div id="db-status" class="mb-4"></div>
 
-        <!-- Overview stats -->
-        <div class="section">
-          <h3 class="font-semibold mb-3">${i18n.t('admin_stats_title')}</h3>
-          <div id="admin-stats" class="grid grid-2 gap-3">
-            <div class="skeleton skeleton-card"></div>
-            <div class="skeleton skeleton-card"></div>
-          </div>
-        </div>
-
-        <!-- App activity stats -->
-        <div class="section mt-6">
-          <h3 class="font-semibold mb-3">${i18n.t('admin_activity_title')}</h3>
-          <div id="admin-activity" class="grid grid-2 gap-3">
-            <div class="skeleton skeleton-card"></div>
-            <div class="skeleton skeleton-card"></div>
-          </div>
-        </div>
-
-        <!-- Scan trend (last 7 days) -->
-        <div class="section mt-6">
-          <h3 class="font-semibold mb-3">${i18n.t('admin_scan_trend_title')}</h3>
-          <div id="scan-trend">
-            <div class="skeleton skeleton-card"></div>
-          </div>
-        </div>
-
-        <!-- Assistant queries per user -->
-        <div class="section mt-6">
-          <h3 class="font-semibold mb-3">${i18n.t('admin_queries_by_user_title')}</h3>
-          <div id="queries-by-user" class="stagger-children">
-            <div class="skeleton skeleton-card"></div>
-          </div>
-        </div>
-
         <!-- Pending requests -->
         <div class="section">
           <div class="flex items-center justify-between mb-3">
@@ -98,13 +64,7 @@ const AdminPage = {
   },
 
   async reload() {
-    await Promise.all([
-      this.loadDbStatus(),
-      this.loadActivityStats(),
-      this.loadQueriesByUser(),
-      this.loadPending(),
-      this.loadAllUsers(),
-    ]);
+    await Promise.all([this.loadDbStatus(), this.loadPending(), this.loadAllUsers()]);
   },
 
   async loadDbStatus() {

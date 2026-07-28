@@ -293,21 +293,6 @@ class ApiClient {
     return this.get('/admin/db-status');
   }
 
-  /** System-wide activity counters (scans, medications, reminders, queries) */
-  getAdminStats() {
-    return this.get('/admin/stats');
-  }
-
-  /** Per-user breakdown of drug-assistant queries (most active users first) */
-  getQueryStatsByUser() {
-    return this.get('/admin/query-stats');
-  }
-
-  /** The individual drug-assistant queries made by a single user (newest first) */
-  getUserQueries(userId) {
-    return this.get(`/admin/users/${userId}/queries`);
-  }
-
   // ── Scan Endpoints ────────────────────────────────────────────
 
   async scanPill(imageFile) {
